@@ -1,11 +1,12 @@
-﻿using Mapster.Models;
-using System;
+﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Mapster.Adapters;
+using Mapster.Models;
 using Mapster.Utils;
 
 namespace Mapster
@@ -13,9 +14,7 @@ namespace Mapster
     public class TypeAdapterConfig
     {
         public static List<TypeAdapterRule> RulesTemplate { get; } = CreateRuleTemplate();
-
-        private static TypeAdapterConfig? _globalSettings;
-        public static TypeAdapterConfig GlobalSettings => _globalSettings ??= new TypeAdapterConfig();
+        public static TypeAdapterConfig GlobalSettings { get; } = new TypeAdapterConfig();
 
         private static List<TypeAdapterRule> CreateRuleTemplate()
         {
@@ -86,12 +85,11 @@ namespace Mapster
         public bool AllowImplicitSourceInheritance { get; set; } = true;
         public bool SelfContainedCodeGeneration { get; set; }
 
-        internal static readonly Func<LambdaExpression, Delegate> DefaultCompiler = lambda => lambda.Compile();
-        public Func<LambdaExpression, Delegate> Compiler { get; set; } = DefaultCompiler;
+        public Func<LambdaExpression, Delegate> Compiler { get; set; } = lambda => lambda.Compile();
 
         public List<TypeAdapterRule> Rules { get; internal set; }
         public TypeAdapterSetter Default { get; internal set; }
-        public Dictionary<TypeTuple, TypeAdapterRule> RuleMap { get; internal set; } = new Dictionary<TypeTuple, TypeAdapterRule>();
+        public ConcurrentDictionary<TypeTuple, TypeAdapterRule> RuleMap { get; internal set; } = new ConcurrentDictionary<TypeTuple, TypeAdapterRule>();
 
         public TypeAdapterConfig()
         {
@@ -112,7 +110,7 @@ namespace Mapster
                 Priority = arg => canMap(arg.SourceType, arg.DestinationType, arg.MapType) ? (int?)25 : null,
                 Settings = new TypeAdapterSettings(),
             };
-            this.Rules.Add(rule);
+            this.Rules.LockAdd(rule);
             return new TypeAdapterSetter(rule.Settings, this);
         }
 
@@ -123,7 +121,7 @@ namespace Mapster
                 Priority = arg => canMap(arg) ? (int?)25 : null,
                 Settings = new TypeAdapterSettings(),
             };
-            this.Rules.Add(rule);
+            this.Rules.LockAdd(rule);
             return new TypeAdapterSetter(rule.Settings, this);
         }
 
@@ -162,19 +160,14 @@ namespace Mapster
 
         private TypeAdapterSettings GetSettings(TypeTuple key)
         {
-            if (this.RuleMap.TryGetValue(key, out var rule)) 
-                return rule.Settings;
-            lock (this.RuleMap)
+            var rule = this.RuleMap.GetOrAdd(key, types =>
             {
-                if (this.RuleMap.TryGetValue(key, out rule)) 
-                    return rule.Settings;
-
-                rule = key.Source == typeof(void)
-                    ? CreateDestinationTypeRule(key)
-                    : CreateTypeTupleRule(key);
-                this.Rules.Add(rule);
-                this.RuleMap.Add(key, rule);
-            }
+                var r = types.Source == typeof(void)
+                    ? CreateDestinationTypeRule(types)
+                    : CreateTypeTupleRule(types);
+                this.Rules.LockAdd(r);
+                return r;
+            });
             return rule.Settings;
         }
 
@@ -219,7 +212,9 @@ namespace Mapster
                     score--;
                     type1 = type1.GetTypeInfo().BaseType;
                 }
-                return type1 == null ? null : (int?)score;
+                return type1 != null && type1.GetTypeInfo().IsGenericType && type1.GetGenericTypeDefinition() == type2 
+                    ? (int?)score
+                    : null;
             }
             if (!allowInheritance)
                 return null;
@@ -241,24 +236,21 @@ namespace Mapster
             return score;
         }
 
-        private T AddToHash<T>(Dictionary<TypeTuple, T> hash, TypeTuple key, Func<TypeTuple, T> func)
+        private T AddToHash<T>(ConcurrentDictionary<TypeTuple, T> hash, TypeTuple key, Func<TypeTuple, T> func)
         {
-            lock (hash)
+            return hash.GetOrAdd(key, types =>
             {
-                if (hash.TryGetValue(key, out var del))
-                    return del;
+                var del = func(types);
+                hash[types] = del;
 
-                del = func(key);
-                hash[key] = del;
-
-                this.RuleMap.TryGetValue(key, out var rule);
-                if (rule != null)
+                if (this.RuleMap.TryGetValue(types, out var rule))
                     rule.Settings.Compiled = true;
                 return del;
-            }
+
+            });
         }
 
-        private readonly Dictionary<TypeTuple, Delegate> _mapDict = new Dictionary<TypeTuple, Delegate>();
+        private readonly ConcurrentDictionary<TypeTuple, Delegate> _mapDict = new ConcurrentDictionary<TypeTuple, Delegate>();
         public Func<TSource, TDestination> GetMapFunction<TSource, TDestination>()
         {
             return (Func<TSource, TDestination>)GetMapFunction(typeof(TSource), typeof(TDestination));
@@ -271,7 +263,7 @@ namespace Mapster
             return del;
         }
 
-        private readonly Dictionary<TypeTuple, Delegate> _mapToTargetDict = new Dictionary<TypeTuple, Delegate>();
+        private readonly ConcurrentDictionary<TypeTuple, Delegate> _mapToTargetDict = new ConcurrentDictionary<TypeTuple, Delegate>();
         public Func<TSource, TDestination, TDestination> GetMapToTargetFunction<TSource, TDestination>()
         {
             return (Func<TSource, TDestination, TDestination>)GetMapToTargetFunction(typeof(TSource), typeof(TDestination));
@@ -284,7 +276,7 @@ namespace Mapster
             return del;
         }
 
-        private readonly Dictionary<TypeTuple, MethodCallExpression> _projectionDict = new Dictionary<TypeTuple, MethodCallExpression>();
+        private readonly ConcurrentDictionary<TypeTuple, MethodCallExpression> _projectionDict = new ConcurrentDictionary<TypeTuple, MethodCallExpression>();
         internal Expression<Func<TSource, TDestination>> GetProjectionExpression<TSource, TDestination>()
         {
             var del = GetProjectionCallExpression(typeof(TSource), typeof(TDestination));
@@ -299,28 +291,55 @@ namespace Mapster
             return del;
         }
 
-        private Dictionary<TypeTuple, Delegate>? _dynamicMapDict;
-        internal Func<object, TDestination> GetDynamicMapFunction<TDestination>(Type sourceType)
+        private readonly ConcurrentDictionary<TypeTuple, Delegate> _dynamicMapDict = new ConcurrentDictionary<TypeTuple, Delegate>();
+        public Func<object, TDestination> GetDynamicMapFunction<TDestination>(Type sourceType)
         {
-            if (_dynamicMapDict == null)
-                _dynamicMapDict = new Dictionary<TypeTuple, Delegate>();
             var key = new TypeTuple(sourceType, typeof(TDestination));
             if (!_dynamicMapDict.TryGetValue(key, out var del)) 
                 del = AddToHash(_dynamicMapDict, key, tuple => Compiler(CreateDynamicMapExpression(tuple)));
             return (Func<object, TDestination>)del;
         }
 
-        internal LambdaExpression CreateMapExpression(TypeTuple tuple, MapType mapType)
+        private Expression CreateSelfExpression()
+        {
+            if (this == GlobalSettings)
+                return Expression.Property(null, typeof(TypeAdapterConfig).GetProperty(nameof(GlobalSettings)));
+            else
+                return Expression.Constant(this);
+        }
+
+        internal Expression CreateDynamicMapInvokeExpressionBody(Type destinationType, Expression p1)
+        {
+            var method = (from m in typeof(TypeAdapterConfig).GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                where m.Name == nameof(GetDynamicMapFunction)
+                select m).First().MakeGenericMethod(destinationType);
+            var getType = typeof(object).GetMethod(nameof(GetType));
+            var invoker = Expression.Call(CreateSelfExpression(), method, Expression.Call(p1, getType));
+            return Expression.Call(invoker, "Invoke", null, p1);
+        }
+
+        public LambdaExpression CreateMapExpression(TypeTuple tuple, MapType mapType)
         {
             var context = new CompileContext(this);
             context.Running.Add(tuple);
+            Action<TypeAdapterConfig>? fork = null;
             try
             {
                 var arg = GetCompileArgument(tuple, mapType, context);
+                fork = arg.Settings.Fork;
+                if (fork != null)
+                {
+                    var cloned = this.Clone();
+                    fork(cloned);
+                    context.Configs.Push(cloned);
+                    arg.Settings = cloned.GetMergedSettings(tuple, mapType);
+                }
                 return CreateMapExpression(arg);
             }
             finally
             {
+                if (fork != null)
+                    context.Configs.Pop();
                 context.Running.Remove(tuple);
             }
         }
@@ -426,20 +445,17 @@ namespace Mapster
                 var method = (from m in typeof(TypeAdapterConfig).GetMethods(BindingFlags.Instance | BindingFlags.Public)
                     where m.Name == nameof(GetMapFunction)
                     select m).First().MakeGenericMethod(sourceType, destinationType);
-                invoker = Expression.Call(Expression.Constant(this), method);
+                invoker = Expression.Call(CreateSelfExpression(), method);
             }
             return Expression.Call(invoker, "Invoke", null, p);
         }
 
-        internal Expression CreateMapInvokeExpressionBody(Type sourceType, Type destinationType, Expression p1, Expression? p2)
+        internal Expression CreateMapToTargetInvokeExpressionBody(Type sourceType, Type destinationType, Expression p1, Expression p2)
         {
-            if (p2 == null)
-                return CreateMapInvokeExpressionBody(sourceType, destinationType, p1);
-
             var method = (from m in typeof(TypeAdapterConfig).GetMethods(BindingFlags.Instance | BindingFlags.Public)
                 where m.Name == nameof(GetMapToTargetFunction)
                 select m).First().MakeGenericMethod(sourceType, destinationType);
-            var invoker = Expression.Call(Expression.Constant(this), method);
+            var invoker = Expression.Call(CreateSelfExpression(), method);
             return Expression.Call(invoker, "Invoke", null, p1, p2);
         }
 
@@ -447,8 +463,72 @@ namespace Mapster
         {
             var p1 = Expression.Parameter(sourceType);
             var p2 = Expression.Parameter(destinationType);
-            var invoke = CreateMapInvokeExpressionBody(sourceType, destinationType, p1, p2);
+            var invoke = CreateMapToTargetInvokeExpressionBody(sourceType, destinationType, p1, p2);
             return Expression.Lambda(invoke, p1, p2);
+        }
+
+        private IEnumerable<TypeAdapterRule> GetAttributeSettings(TypeTuple tuple, MapType mapType)
+        {
+            var rules1 = from type in tuple.Source.GetAllTypes()
+                from o in type.GetTypeInfo().GetCustomAttributes(false)
+                let attr = o as AdaptToAttribute
+                where attr != null && (attr.MapType & mapType) != 0
+                where attr.Type == null || attr.Type == tuple.Destination
+                where attr.Name == null || attr.Name.Replace("[name]", type.Name) == tuple.Destination.Name
+                let distance = GetSubclassDistance(tuple.Source, type, true)
+                select new TypeAdapterRule
+                {
+                    Priority = arg => distance + 50,
+                    Settings = CreateSettings(attr)
+                };
+            if (tuple.Source == tuple.Destination)
+                return rules1;
+            var rules2 = from type in tuple.Destination.GetAllTypes()
+                from o in type.GetTypeInfo().GetCustomAttributes(false)
+                let attr = o as BaseAdaptAttribute
+                where attr != null && (attr.MapType & mapType) != 0 && (attr is AdaptFromAttribute || attr is AdaptTwoWaysAttribute)
+                where attr.Type == null || attr.Type == tuple.Source
+                where attr.Name == null || attr.Name.Replace("[name]", type.Name) == tuple.Source.Name
+                let distance = GetSubclassDistance(tuple.Destination, type, true)
+                select new TypeAdapterRule
+                {
+                    Priority = arg => distance + 50,
+                    Settings = CreateSettings(attr)
+                };
+            return rules1.Concat(rules2);
+        }
+
+        private TypeAdapterSettings CreateSettings(BaseAdaptAttribute attr)
+        {
+            var settings = new TypeAdapterSettings();
+            var setter = new TypeAdapterSetter(settings, this);
+            if (attr.IgnoreAttributes != null)
+                setter.IgnoreAttribute(attr.IgnoreAttributes);
+            if (attr.IgnoreNoAttributes != null)
+            {
+                setter.IgnoreMember((member, _) => !member.GetCustomAttributes(true)
+                    .Select(it => it.GetType())
+                    .Intersect(attr.IgnoreNoAttributes)
+                    .Any());
+            }
+            if (attr.IgnoreNamespaces != null)
+            {
+                foreach (var ns in attr.IgnoreNamespaces)
+                {
+                    setter.IgnoreMember((member, _) => member.Type.Namespace?.StartsWith(ns) == true);
+                }
+            }
+            if (attr.IgnoreNullValues)
+                setter.IgnoreNullValues(attr.IgnoreNullValues);
+            if (attr.MapToConstructor)
+                setter.MapToConstructor(attr.MapToConstructor);
+            if (attr.MaxDepth > 0)
+                setter.MaxDepth(attr.MaxDepth);
+            if (attr.PreserveReference)
+                setter.PreserveReference(attr.PreserveReference);
+            if (attr.ShallowCopyForSameType)
+                setter.ShallowCopyForSameType(attr.ShallowCopyForSameType);
+            return settings;
         }
 
         internal TypeAdapterSettings GetMergedSettings(TypeTuple tuple, MapType mapType)
@@ -460,15 +540,20 @@ namespace Mapster
                 MapType = mapType,
                 ExplicitMapping = this.RuleMap.ContainsKey(tuple),
             };
-            var settings = (from rule in this.Rules.Reverse<TypeAdapterRule>()
-                            let priority = rule.Priority(arg)
-                            where priority != null
-                            orderby priority!.Value descending
-                            select rule.Settings).ToList();
             var result = new TypeAdapterSettings();
-            foreach (var setting in settings)
+            lock (this.Rules)
             {
-                result.Apply(setting);
+                var rules = this.Rules.Reverse<TypeAdapterRule>()
+                    .Concat(GetAttributeSettings(tuple, mapType));
+                var settings = from rule in rules
+                    let priority = rule.Priority(arg)
+                    where priority != null
+                    orderby priority.Value descending
+                    select rule.Settings;
+                foreach (var setting in settings)
+                {
+                    result.Apply(setting);
+                }
             }
 
             //remove recursive include types
@@ -482,7 +567,7 @@ namespace Mapster
         private CompileArgument GetCompileArgument(TypeTuple tuple, MapType mapType, CompileContext context)
         {
             var setting = GetMergedSettings(tuple, mapType);
-            var arg = new CompileArgument
+            return new CompileArgument
             {
                 SourceType = tuple.Source,
                 DestinationType = tuple.Destination,
@@ -491,7 +576,6 @@ namespace Mapster
                 Context = context,
                 Settings = setting,
             };
-            return arg;
         }
 
         public void Compile()
@@ -582,32 +666,31 @@ namespace Mapster
 
         private void Remove(TypeTuple key)
         {
-            if (this.RuleMap.TryGetValue(key, out var rule))
-            {
-                this.RuleMap.Remove(key);
-                this.Rules.Remove(rule);
-            }
-            _mapDict.Remove(key);
-            _mapToTargetDict.Remove(key);
-            _projectionDict.Remove(key);
-            _dynamicMapDict?.Remove(key);
+            if (this.RuleMap.TryRemove(key, out var rule))
+                this.Rules.LockRemove(rule);
+            _mapDict.TryRemove(key, out _);
+            _mapToTargetDict.TryRemove(key, out _);
+            _projectionDict.TryRemove(key, out _);
+            _dynamicMapDict.TryRemove(key, out _);
         }
 
-        private static TypeAdapterConfig? _cloneConfig;
-        public TypeAdapterConfig Clone()
+        private static readonly Lazy<TypeAdapterConfig> _cloneConfig = new Lazy<TypeAdapterConfig>(() =>
         {
-            if (_cloneConfig == null)
-            {
-                _cloneConfig = new TypeAdapterConfig();
-                _cloneConfig.Default.Settings.PreserveReference = true;
-                _cloneConfig.ForType<TypeAdapterSettings, TypeAdapterSettings>()
-                    .MapWith(src => src.Clone(), true);
-            }
-            var fn = _cloneConfig.GetMapFunction<TypeAdapterConfig, TypeAdapterConfig>();
+            var config = new TypeAdapterConfig();
+            config.Default.Settings.PreserveReference = true;
+            config.ForType<TypeAdapterSettings, TypeAdapterSettings>()
+                .MapWith(src => src.Clone(), true);
+            return config;
+        });
+        public TypeAdapterConfig Clone()
+        { 
+            var fn = _cloneConfig.Value.GetMapFunction<TypeAdapterConfig, TypeAdapterConfig>();
             return fn(this);
         }
 
-        private Dictionary<string, TypeAdapterConfig>? _inlineConfigs;
+        private ConcurrentDictionary<string, TypeAdapterConfig>? _inlineConfigs;
+        private ConcurrentDictionary<string, TypeAdapterConfig> InlineConfigs =>
+            _inlineConfigs ??= new ConcurrentDictionary<string, TypeAdapterConfig>();
         public TypeAdapterConfig Fork(Action<TypeAdapterConfig> action,
 #if !NET40
             [CallerFilePath]
@@ -618,22 +701,13 @@ namespace Mapster
 #endif
             int key2 = 0)
         {
-            if (_inlineConfigs == null)
-                _inlineConfigs = new Dictionary<string, TypeAdapterConfig>();
-            var key = key1 + '|' + key2;
-            if (_inlineConfigs.TryGetValue(key, out var config))
-                return config;
-
-            lock (_inlineConfigs)
+            var key = $"{key1}|{key2}";
+            return InlineConfigs.GetOrAdd(key, _ =>
             {
-                if (_inlineConfigs.TryGetValue(key, out config))
-                    return config;
-
                 var cloned = this.Clone();
                 action(cloned);
-                _inlineConfigs[key] = config = cloned;
-            }
-            return config;
+                return cloned;
+            });
         }
     }
 

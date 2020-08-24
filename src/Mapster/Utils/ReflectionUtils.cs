@@ -106,7 +106,7 @@ namespace Mapster
         // so we need to process every one of them separately.
         public static IEnumerable<Type> GetAllInterfaces(this Type interfaceType)
         {
-            var allInterfaces = new List<Type>();
+            var allInterfaces = new HashSet<Type>();
             var interfaceQueue = new Queue<Type>();
             allInterfaces.Add(interfaceType);
             interfaceQueue.Enqueue(interfaceType);
@@ -159,9 +159,7 @@ namespace Mapster
 
         public static Expression? CreateConvertMethod(Type srcType, Type destType, Expression source)
         {
-            var name = _primitiveTypes.GetValueOrDefault(destType);
-
-            if (name == null)
+            if (!_primitiveTypes.TryGetValue(destType, out var name))
                 return null;
 
             var method = typeof(Convert).GetMethod(name, new[] { srcType });
@@ -333,9 +331,11 @@ namespace Mapster
 
         public static string GetMemberName(this IMemberModel member, List<Func<IMemberModel, string?>> getMemberNames, Func<string, string> nameConverter)
         {
-            return getMemberNames.Select(predicate => predicate(member))
+            var memberName = getMemberNames.Select(predicate => predicate(member))
                 .FirstOrDefault(name => name != null)
-                ?? nameConverter(member.Name);
+                ?? member.Name;
+
+            return nameConverter(memberName);
         }
 
         public static bool IsPrimitiveKind(this Type type)
@@ -378,6 +378,15 @@ namespace Mapster
         public static bool IsObjectReference(this Type type)
         {
             return !type.GetTypeInfo().IsValueType && type != typeof(string);
+        }
+
+        public static IEnumerable<Type> GetAllTypes(this Type type)
+        {
+            do
+            {
+                yield return type;
+                type = type.GetTypeInfo().BaseType;
+            } while (type != null && type != typeof(object));
         }
     }
 }

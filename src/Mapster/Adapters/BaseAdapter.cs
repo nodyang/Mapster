@@ -108,9 +108,16 @@ namespace Mapster.Adapters
                     if (exp != null)
                         return exp.To(arg.DestinationType, true);
                 }
-                
-                if (arg.Context.Running.Count > 1 && !arg.Context.Config.SelfContainedCodeGeneration && !arg.Context.IsSubFunction())
-                    return arg.Context.Config.CreateMapInvokeExpressionBody(source.Type, arg.DestinationType, source, destination);
+
+                if (arg.Context.Running.Count > 1 && 
+                    !arg.Context.Config.SelfContainedCodeGeneration &&
+                    !arg.Context.IsSubFunction())
+                {
+                    if (destination == null)
+                        return arg.Context.Config.CreateMapInvokeExpressionBody(source.Type, arg.DestinationType, source);
+                    else 
+                        return arg.Context.Config.CreateMapToTargetInvokeExpressionBody(source.Type, arg.DestinationType, source, destination);
+                }
                 else
                     return CreateBlockExpressionBody(source, destination, arg);
             }
@@ -181,7 +188,11 @@ namespace Mapster.Adapters
                 set = Expression.Coalesce(destination, set);
             }
 
-            if (set.NodeType != ExpressionType.Throw)
+            if (set.NodeType == ExpressionType.Throw)
+            {
+                blocks.Add(set);
+            }
+            else
             {
                 //TDestination result;
                 //if (source == null)
@@ -193,17 +204,6 @@ namespace Mapster.Adapters
                         Expression.IfThen(compareNull,
                             Expression.Return(label, arg.DestinationType.CreateDefault()))
                     );
-                }
-
-                //if (object.ReferenceEquals(source, destination))
-                //  return destination;
-                if (destination != null && 
-                    source.Type.IsObjectReference() &&
-                    destination.Type.IsObjectReference() &&
-                    (source.Type.IsAssignableFrom(destination.Type) || destination.Type.IsAssignableFrom(source.Type)))
-                {
-                    var refEquals = Expression.Call(typeof(object), nameof(ReferenceEquals), null, source, destination);
-                    blocks.Add(Expression.IfThen(refEquals, Expression.Return(label, destination)));
                 }
 
                 //var result = new TDest();
@@ -228,8 +228,8 @@ namespace Mapster.Adapters
 
                 //using (var scope = new MapContextScope()) {
                 //  var references = scope.Context.Reference;
-                //  object cache;
-                //  if (references.TryGetValue(source, out cache))
+                //  var key = new ReferenceTuple(source, typeof(TDestination));
+                //  if (references.TryGetValue(key, out var cache))
                 //      return (TDestination)cache;
                 //
                 //  var result = new TDestination();
@@ -237,6 +237,7 @@ namespace Mapster.Adapters
                 //  result.prop = adapt(source.prop);
                 //  return result;
                 //}
+                
                 if (arg.Settings.PreserveReference == true &&
                     arg.SourceType.IsObjectReference() &&
                     arg.DestinationType.IsObjectReference())
@@ -247,28 +248,35 @@ namespace Mapster.Adapters
                     var newScope = Expression.Assign(scope, Expression.New(typeof(MapContextScope)));
                     blocks.Add(newScope);
 
-                    var dictType = typeof(Dictionary<object, object>);
+                    var dictType = typeof(Dictionary<ReferenceTuple, object>);
                     var references = Expression.Variable(dictType, "references");
                     var refContext = Expression.Property(scope, "Context");
                     var refDict = Expression.Property(refContext, "References");
                     var assignReferences = Expression.Assign(references, refDict);
 
+                    var tupleType = typeof(ReferenceTuple);
+                    var key = Expression.Variable(tupleType, "key");
+                    var assignKey = Expression.Assign(key,
+                        Expression.New(tupleType.GetConstructor(new[] {typeof(object), typeof(Type)}),
+                            source,
+                            Expression.Constant(arg.DestinationType)));
+
                     var cache = Expression.Variable(typeof(object), "cache");
-                    var tryGetMethod = typeof(Dictionary<object, object>).GetMethod("TryGetValue", new[] { typeof(object), typeof(object).MakeByRefType() });
-                    var checkHasRef = Expression.Call(references, tryGetMethod, source, cache);
+                    var tryGetMethod = dictType.GetMethod("TryGetValue", new[] { typeof(ReferenceTuple), typeof(object).MakeByRefType() });
+                    var checkHasRef = Expression.Call(references, tryGetMethod, key, cache);
                     var setResult = Expression.IfThen(
                         checkHasRef,
                         Expression.Return(label, cache.To(arg.DestinationType)));
 
                     var indexer = dictType.GetProperties().First(item => item.GetIndexParameters().Length > 0);
                     var refAssign = Expression.Assign(
-                        Expression.Property(references, indexer, Expression.Convert(source, typeof(object))),
+                        Expression.Property(references, indexer, key),
                         Expression.Convert(result, typeof(object)));
                     assignActions.Add(refAssign);
 
                     var usingBody = Expression.Block(
-                        new[] { cache, references, result },
-                        new Expression[] {assignReferences, setResult}
+                        new[] { cache, references, key, result },
+                        new Expression[] {assignReferences, assignKey, setResult}
                             .Concat(assignActions)
                             .Concat(settingActions));
 
@@ -409,7 +417,7 @@ namespace Mapster.Adapters
             var exp = CreateAdaptExpressionCore(source, destinationType, arg, mapping, destination);
 
             //transform(adapt(source));
-            var transform = arg.Settings.DestinationTransforms.FirstOrDefault(it => it.Condition(exp.Type));
+            var transform = arg.Settings.DestinationTransforms.Find(it => it.Condition(exp.Type));
             if (transform != null)
                 exp = transform.TransformFunc(exp.Type).Apply(arg.MapType, exp);
             return exp.To(destinationType);

@@ -11,7 +11,6 @@ namespace Mapster.Adapters
     internal class CollectionAdapter : BaseAdapter
     {
         protected override int Score => -125;
-        protected override bool UseTargetValue => true;
         protected override ObjectType ObjectType => ObjectType.Collection;
 
         protected override bool CanMap(PreCompileArgument arg)
@@ -95,13 +94,6 @@ namespace Mapster.Adapters
                 actions.Add(ExpressionEx.Assign(list, destination)); //convert to list type
             }
 
-            //list.Clear();
-            if (arg.MapType == MapType.MapToTarget)
-            {
-                var clear = list.Type.GetMethod("Clear", Type.EmptyTypes);
-                actions.Add(Expression.Call(list, clear));
-            }
-
             actions.Add(CreateListSet(source, list, arg));
 
             if (shouldConvert)
@@ -119,7 +111,8 @@ namespace Mapster.Adapters
             var destinationElementType = arg.DestinationType.ExtractCollectionType();
 
             var p1 = Expression.Parameter(sourceElementType);
-            var adapt = CreateAdaptExpression(p1, destinationElementType, arg);
+            var adapt = CreateAdaptExpression(p1, destinationElementType, arg)
+                .To(destinationElementType, true);
             if (adapt == p1)
             {
                 if (arg.MapType == MapType.Projection)
@@ -152,14 +145,33 @@ namespace Mapster.Adapters
                           select m).First().MakeGenericMethod(sourceElementType, destinationElementType);
             exp = Expression.Call(method, exp, Expression.Lambda(adapt, p1));
             if (exp.Type != arg.DestinationType)
-            {
-                //src.Select(item => convert(item)).ToList()
-                var toList = (from m in typeof(Enumerable).GetMethods()
-                              where m.Name == nameof(Enumerable.ToList)
-                              select m).First().MakeGenericMethod(destinationElementType);
-                exp = Expression.Call(toList, exp);
-            }
+                exp = InlineChangeType(exp, arg);
             return exp;
+        }
+
+        private static Expression InlineChangeType(Expression exp, CompileArgument arg)
+        {
+            var destinationElementType = arg.DestinationType.ExtractCollectionType();
+
+            //src.Select(item => convert(item)).ToList()
+            if (arg.DestinationType.IsAssignableFromList())
+            {
+                var toList = (from m in typeof(Enumerable).GetMethods()
+                    where m.Name == nameof(Enumerable.ToList)
+                    select m).First().MakeGenericMethod(destinationElementType);
+                return Expression.Call(toList, exp);
+            }
+            else // if (arg.DestinationType.IsAssignableFromSet())
+            {
+                var set = typeof(HashSet<>).MakeGenericType(destinationElementType);
+                var ctor = (from c in set.GetConstructors()
+                    let a = c.GetParameters()
+                    where a.Length == 1 &&
+                          a[0].ParameterType.GetTypeInfo().IsGenericType &&
+                          a[0].ParameterType.GetGenericTypeDefinition() == typeof(IEnumerable<>)
+                    select c).First();
+                return Expression.New(ctor, exp);
+            }
         }
 
         private Expression CreateListSet(Expression source, Expression destination, CompileArgument arg)

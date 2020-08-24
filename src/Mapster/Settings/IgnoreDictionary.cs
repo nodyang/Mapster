@@ -1,11 +1,11 @@
 ﻿using Mapster.Utils;
-using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Linq.Expressions;
 
 namespace Mapster
 {
-    public class IgnoreDictionary : Dictionary<string, IgnoreDictionary.IgnoreItem>, IApplyable<IgnoreDictionary>
+    public class IgnoreDictionary : ConcurrentDictionary<string, IgnoreDictionary.IgnoreItem>, IApplyable<IgnoreDictionary>
     {
         public readonly struct IgnoreItem
         {
@@ -43,10 +43,10 @@ namespace Mapster
                 var body = item.IsChildPath ? item.Condition.Body : item.Condition.Apply(param[0], param[1]);
                 var condition = Expression.Lambda(Expression.OrElse(src.Condition.Body, body), param);
 
-                this[name] = new IgnoreItem(condition, src.IsChildPath);
+                TryUpdate(name, new IgnoreItem(condition, src.IsChildPath), item);
             }
             else
-                this[name] = src;
+                TryAdd(name, src);
 
         }
 

@@ -1,19 +1,18 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Collections;
-using Mapster.Utils;
+using System.Collections.Concurrent;
 
 namespace Mapster
 {
     public class SettingStore: IApplyable<SettingStore>
     {
-        private readonly Dictionary<string, object> _objectStore = new Dictionary<string, object>();
-        private readonly Dictionary<string, bool?> _booleanStore = new Dictionary<string, bool?>();
+        private readonly ConcurrentDictionary<string, object> _objectStore = new ConcurrentDictionary<string, object>();
+        private readonly ConcurrentDictionary<string, bool?> _booleanStore = new ConcurrentDictionary<string, bool?>();
 
         public void Set(string key, bool? value)
         {
             if (value == null)
-                _booleanStore.Remove(key);
+                _booleanStore.TryRemove(key, out _);
             else
                 _booleanStore[key] = value;
         }
@@ -21,29 +20,24 @@ namespace Mapster
         public void Set(string key, object? value)
         {
             if (value == null)
-                _objectStore.Remove(key);
+                _objectStore.TryRemove(key, out _);
             else
                 _objectStore[key] = value;
         }
 
         public bool? Get(string key)
         {
-            return _booleanStore.GetValueOrDefault(key);
+            return _booleanStore.TryGetValue(key, out var value) ? value : null;
         }
 
-        public T Get<T>(string key)
+        public T? Get<T>(string key) where T : class
         {
-            return (T)_objectStore.GetValueOrDefault(key)!;
+            return _objectStore.TryGetValue(key, out var value) ? (T)value : null;
         }
 
-        public T Get<T>(string key, Func<T> initializer)
+        public T Get<T>(string key, Func<T> initializer) where T : class
         {
-            var value = _objectStore.GetValueOrDefault(key);
-            if (value == null)
-            {
-                _objectStore[key] = value = initializer()!;
-            }
-            return (T)value;
+            return (T)_objectStore.GetOrAdd(key, _ => initializer());
         }
 
         public virtual void Apply(object other)
@@ -55,32 +49,21 @@ namespace Mapster
         {
             foreach (var kvp in other._booleanStore)
             {
-                if (_booleanStore.GetValueOrDefault(kvp.Key) == null)
-                    _booleanStore[kvp.Key] = kvp.Value;
+                _booleanStore.TryAdd(kvp.Key, kvp.Value);
             }
 
             foreach (var kvp in other._objectStore)
             {
-                var self = _objectStore.GetValueOrDefault(kvp.Key);
-                if (self == null)
+                var self = _objectStore.GetOrAdd(kvp.Key, key =>
                 {
                     var value = kvp.Value;
                     if (value is IApplyable)
-                    {
-                        var applyable = (IApplyable)Activator.CreateInstance(value.GetType())!;
-                        applyable.Apply(value);
-                        value = applyable;
-                    }
-                    else if (value is IList side)
-                    {
-                        var list = (IList)Activator.CreateInstance(value.GetType())!;
-                        foreach (var item in side)
-                            list.Add(item);
-                        value = list;
-                    }
-                    _objectStore[kvp.Key] = value;
-                }
-                else if (self is IApplyable applyable)
+                        return (IApplyable)Activator.CreateInstance(value.GetType())!;
+                    if (value is IList)
+                        return (IList)Activator.CreateInstance(value.GetType())!;
+                    return value;
+                });
+                if (self is IApplyable applyable)
                 {
                     applyable.Apply(kvp.Value);
                 }

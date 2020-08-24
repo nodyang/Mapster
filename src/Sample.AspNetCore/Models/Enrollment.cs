@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-
-namespace Sample.AspNetCore.Models
+﻿namespace Sample.AspNetCore.Models
 {
     public enum Grade
     {
@@ -19,4 +14,5 @@ namespace Sample.AspNetCore.Models
 
         public Course Course { get; set; }
         public Student Student { get; set; }
-    }}
+    }
+}

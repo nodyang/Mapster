@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Shouldly;
 
@@ -154,6 +155,43 @@ namespace Mapster.Tests
             dto2.Address.Location.ShouldBeNull();
         }
 
+        [TestMethod]
+        public void TestMappingToSelf()
+        {
+            var config = new TypeAdapterConfig();
+            config.NewConfig<Post, Post>()
+                .Map(nameof(Post.Secret), x => default(string))
+                .Map(nameof(Post.Dic) + ".Secret", x => default(string));
+
+            var p1 = new Post
+            {
+                Secret = "Test", 
+                Dic = new Dictionary<string, string>
+                {
+                    { "Secret", "test" }, 
+                    {"B", "test2" }
+                }
+            };
+
+            p1.Adapt(p1, config);
+            p1.Dic["Secret"].ShouldBeNull();
+            p1.Secret.ShouldBeNull();
+        }
+
+        [TestMethod]
+        public void TestMappingFromDictionary()
+        {
+            var config = new TypeAdapterConfig();
+            config.NewConfig<Post, Post>()
+                .Map(nameof(Post.Dic) + ".Name", nameof(Post.Dic) + ".Name");
+
+            var p1 = new Post{ Dic = new Dictionary<string, string> { { "Name", "test"}, {"Secret" , "password" }} };
+            var p2 = new Post();
+            p1.Adapt(p2, config);
+
+            p2.Dic["Name"].ShouldBe("test");
+        }
+
         public class Poco
         {
             public Guid Id { get; set; }
@@ -173,6 +211,12 @@ namespace Mapster.Tests
             public Guid Id { get; set; }
             public Address Address { get; set; }
             public string Location { get; set; }
+        }
+
+        public class Post
+        {
+            public IDictionary<string,string> Dic { get; set; }
+            public string Secret { get; set; }
         }
     }
 }

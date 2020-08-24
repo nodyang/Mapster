@@ -246,6 +246,24 @@ namespace Mapster
             setter.Settings.UseDestinationValues.Add(func);
             return setter;
         }
+
+        internal static TSetter Include<TSetter>(this TSetter setter, Type sourceType, Type destType) where TSetter : TypeAdapterSetter
+        {
+            setter.CheckCompiled();
+
+            setter.Config.Rules.LockAdd(new TypeAdapterRule
+            {
+                Priority = arg =>
+                    arg.SourceType == sourceType &&
+                    arg.DestinationType == destType ? (int?)100 : null,
+                Settings = setter.Settings
+            });
+
+            setter.Settings.Includes.Add(new TypeTuple(sourceType, destType));
+
+            return setter;
+        }
+
     }
 
     public class TypeAdapterSetter<TDestination> : TypeAdapterSetter
@@ -366,8 +384,20 @@ namespace Mapster
             this.Settings.MapToConstructor = ctor;
             return this;
         }
+        
+        public TypeAdapterSetter<TDestination> AfterMappingInline(Expression<Action<TDestination>> action)
+        {
+            this.CheckCompiled();
+
+            var lambda = Expression.Lambda(action.Body, 
+                Expression.Parameter(typeof(object), "src"),
+                action.Parameters[0]);
+            Settings.AfterMappingFactories.Add(arg => lambda);
+            return this;
+        }
     }
 
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Minor Code Smell", "S4136:Method overloads should be grouped together", Justification = "<Pending>")]
     public class TypeAdapterSetter<TSource, TDestination> : TypeAdapterSetter<TDestination>
     {
         internal TypeAdapterSetter(TypeAdapterSettings settings, TypeAdapterConfig parentConfig)
@@ -413,6 +443,11 @@ namespace Mapster
         public new TypeAdapterSetter<TSource, TDestination> MapToConstructor(ConstructorInfo ctor)
         {
             return (TypeAdapterSetter<TSource, TDestination>) base.MapToConstructor(ctor);
+        }
+
+        public new TypeAdapterSetter<TSource, TDestination> AfterMappingInline(Expression<Action<TDestination>> action)
+        {
+            return (TypeAdapterSetter<TSource, TDestination>) base.AfterMappingInline(action);
         }
 
         #endregion
@@ -501,10 +536,7 @@ namespace Mapster
             {
                 var adapter = new DelegateAdapter(converterFactory);
                 Settings.ConverterFactory = adapter.CreateAdaptFunc;
-                if (Settings.ConverterToTargetFactory == null)
-                {
-                    Settings.ConverterToTargetFactory = adapter.CreateAdaptToTargetFunc;
-                }
+                Settings.ConverterToTargetFactory ??= adapter.CreateAdaptToTargetFunc;
             }
             else
             {
@@ -572,7 +604,7 @@ namespace Mapster
             Settings.BeforeMappingFactories.Add(arg => action);
             return this;
         }
-
+        
         public TypeAdapterSetter<TSource, TDestination> AfterMappingInline(Expression<Action<TSource, TDestination>> action)
         {
             this.CheckCompiled();
@@ -580,24 +612,12 @@ namespace Mapster
             Settings.AfterMappingFactories.Add(arg => action);
             return this;
         }
-
+        
         public TypeAdapterSetter<TSource, TDestination> Include<TDerivedSource, TDerivedDestination>()
             where TDerivedSource: class, TSource
             where TDerivedDestination: class, TDestination
         {
-            this.CheckCompiled();
-
-            Config.Rules.Add(new TypeAdapterRule
-            {
-                Priority = arg =>
-                    arg.SourceType == typeof(TDerivedSource) &&
-                    arg.DestinationType == typeof(TDerivedDestination) ? (int?)100 : null,
-                Settings = Settings
-            });
-
-            Settings.Includes.Add(new TypeTuple(typeof(TDerivedSource), typeof(TDerivedDestination)));
-
-            return this;
+            return this.Include(typeof(TDerivedSource), typeof(TDerivedDestination));
         }
 
         public TypeAdapterSetter<TSource, TDestination> Inherits<TBaseSource, TBaseDestination>()
@@ -617,6 +637,14 @@ namespace Mapster
             {
                 Settings.Apply(rule.Settings);
             }
+            return this;
+        }
+
+        public TypeAdapterSetter<TSource, TDestination> Fork(Action<TypeAdapterConfig> action)
+        {
+            this.CheckCompiled();
+
+            Settings.Fork = action;
             return this;
         }
 
@@ -842,6 +870,13 @@ namespace Mapster
         {
             SourceToDestinationSetter.MaxDepth(value);
             DestinationToSourceSetter.MaxDepth(value);
+            return this;
+        }
+
+        public TwoWaysTypeAdapterSetter<TSource, TDestination> Fork(Action<TypeAdapterConfig> action)
+        {
+            SourceToDestinationSetter.Fork(action);
+            DestinationToSourceSetter.Fork(action);
             return this;
         }
     }

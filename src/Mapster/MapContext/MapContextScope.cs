@@ -1,4 +1,5 @@
 ﻿using System;
+using Mapster.Utils;
 
 namespace Mapster
 {
@@ -23,12 +24,12 @@ namespace Mapster
                 MapContext.Current = null;
         }
 
-        public static TResult GetOrAddMapReference<TKey, TResult>(TKey key, Func<TKey, TResult> mapFn)
+        public static TResult GetOrAddMapReference<TResult>(ReferenceTuple key, Func<ReferenceTuple, TResult> mapFn) where TResult : notnull
         {
             using var context = new MapContextScope();
             var dict = context.Context.References;
-            if (!dict.TryGetValue(key!, out var reference))
-                dict[key!] = reference = mapFn(key)!;
+            if (!dict.TryGetValue(key, out var reference))
+                dict[key] = reference = mapFn(key);
             return (TResult)reference;
         }
     }
